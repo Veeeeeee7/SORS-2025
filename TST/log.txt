@@ -1,0 +1,5 @@
+Log started at 2025-06-03 01:47:22.941508
+Torch device: cpu
+Data shape: (10, 437, 24, 6)
+Train samples: 8, Test samples: 2
+Model parameters: d_model=64, num_heads=8, num_variables=6, num_static=2, seq_len=24, num_encoder_layers=6, num_decoder_layers=6, d_ff=256, top_k=50, dropout=0.1
