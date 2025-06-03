@@ -20,16 +20,23 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 log(f'Torch device: {device}')
 torch.set_default_dtype(torch.float32)
 
-data = np.load('/Users/victorli/Documents/GitHub/SORS-2025/TST/data_windowed.npy')
+data = np.load('/Users/victorli/Documents/GitHub/SORS-2025/TST/data/data_windowed.npy')
 data = data[:10]
 log(f"Data shape: {data.shape}")
+
+static = np.load('/Users/victorli/Documents/GitHub/SORS-2025/TST/data/static.npy')
+log(f"Static shape: {static.shape}")
+
+null_stations = np.load('/Users/victorli/Documents/GitHub/SORS-2025/TST/data/null_stations.npy')
+log(f"Null stations shape: {null_stations.shape}")
+null_stations_set = set(map(tuple, null_stations))
 
 split_idx = int(0.8 * len(data))
 train_data = data[:split_idx]
 test_data = data[split_idx:]
 log(f"Train samples: {len(train_data)}, Test samples: {len(test_data)}")
 
-d_model = 64
+d_model = 128
 num_heads = 8
 num_variables = 6
 num_static = 2
@@ -67,7 +74,7 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     model = torch.nn.DataParallel(model)
 model.to(device)
 
-criterion = torch.nn.MSELoss()
+criterion = torch.nn.L1Loss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 for epoch in range(num_epochs):
@@ -78,30 +85,46 @@ for epoch in range(num_epochs):
     sensed_indices = permute[:budget]
     unsensed_indices = permute[budget:]
 
-    # NO MORE BATCHES NEED TO FIX
-
     for i in range(0, len(train_data)):
-        batch_data = train_data[i:i+batch_size]
-        if len(batch_data) < batch_size:
-            continue
-        
-        X = torch.tensor(batch_data).to(device)
-        X = X[:, sensed_indices, :, :]
+        X = torch.tensor(train_data[i, :, :, :])
+        X = X[sensed_indices, :, :]
 
-        static = torch.tensor(batch_data).to(device)
-        static = static[:, sensed_indices, :]
-        unsensed_static = torch.tensor(batch_data).to(device)
-        unsensed_static = unsensed_static[:, unsensed_indices, :]
+        X_static = torch.tensor(static)
+        X_static = X_static[sensed_indices, :]
+
+        X_unsensed_static = torch.tensor(static)
+        X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
         optimizer.zero_grad()
-        output, indices = model(X, static, unsensed_static)
-        
-        target = X[:, unsensed_indices, :, 0]
-        loss = criterion(output, target)
-        
-        loss.backward()
-        optimizer.step()
-        
-        epoch_loss += loss.item()
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device))
 
-    log(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(train_data):.4f}')
+        target = torch.tensor(train_data[i, :, :, :])[unsensed_indices, :, 0]
+
+        loss = criterion(output, target)
+        loss.backward()
+        epoch_loss += loss.item()
+        optimizer.step()
+
+        sensed_indices = set()
+        unsensed_indices = set(range(len(static)))
+        for idx in indices:
+            if (i, idx) not in null_stations_set:
+                sensed_indices.add(idx)
+                unsensed_indices.discard(idx)
+
+        for idx in list(unsensed_indices):
+            if (i, idx) in null_stations_set:
+                unsensed_indices.discard(idx)
+
+        if len(unsensed_indices) < budget - len(sensed_indices):
+            raise Exception(f"Error: fewer than {budget} sensed indices, found {len(unsensed_indices)} indices remaining and need {budget-len(sensed_indices)} indices.")
+        
+        while len(sensed_indices) < budget:
+            idx = np.random.choice(list(unsensed_indices))
+            sensed_indices.add(idx)
+            unsensed_indices.discard(idx)
+
+        sensed_indices = list(sensed_indices)
+        unsensed_indices = list(unsensed_indices)
+
+    log(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(train_data):.8f}')

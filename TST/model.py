@@ -70,7 +70,7 @@ class Selector(nn.Module):
         self.top_k = top_k
 
     def forward(self, X):
-        indices = torch.randperm(X.shape[1])[:self.top_k]
+        indices = torch.randperm(X.shape[0])[:self.top_k]
         return indices
 
 class TimeSeriesTransformerDecoderLayer(nn.Module):
@@ -193,36 +193,34 @@ class TimeSeriesTransformer(nn.Module):
                                                     num_layers=num_decoder_layers,
                                                     dropout=dropout)
         
-        self.output_projection = nn.Linear(d_model, self.num_variables)
+        self.output_projection = nn.Linear(d_model, 1)
 
     def forward(self, X, static, unsensed_static):
         """
         Embedding
-        X.shape: (batch_size, num_sensors, seq_len, num_variables)
-        static.shape: (batch_size, num_sensors, num_static)
+        X.shape: (num_sensors, seq_len, num_variables)
+        static.shape: (num_sensors, num_static)
         """
-        batch_size, num_sensors, _, _ = X.shape
+        num_sensors, _, _ = X.shape
 
-        X_embedding = self.embedding_projection(X.view(batch_size*num_sensors*self.seq_len, self.num_variables))
-        X_embedding = X_embedding.view(batch_size, num_sensors, self.seq_len, self.d_model)
+        X_embedding = self.embedding_projection(X.view(num_sensors*self.seq_len, self.num_variables))
+        X_embedding = X_embedding.view(num_sensors, self.seq_len, self.d_model)
 
-        static_embedding = self.mlp(static.view(batch_size*num_sensors, self.num_static))
-        static_embedding = static_embedding.view(batch_size, num_sensors, self.d_model)
-        static_embedding_broadcasted = static_embedding.unsqueeze(2).expand(batch_size, num_sensors, self.seq_len, self.d_model)
+        static_embedding = self.mlp(static)
+        static_embedding_broadcasted = static_embedding.unsqueeze(1).expand(num_sensors, self.seq_len, self.d_model)
 
-        positional_encoding = self.positional_encoder.unsqueeze(0).unsqueeze(0)
-        positional_encoding = positional_encoding.expand(batch_size, num_sensors, self.seq_len, self.d_model)
-
+        positional_encoding = self.positional_encoder.unsqueeze(0)
+        positional_encoding = positional_encoding.expand(num_sensors, self.seq_len, self.d_model)
 
         embedding = X_embedding + static_embedding_broadcasted + positional_encoding
-
-        embedding = embedding.reshape(batch_size*num_sensors, self.seq_len, self.d_attention)
         embedding = embedding.permute(1, 0, 2)
 
         """
         Encoder
         """
         encoder_output = self.encoder(embedding)
+        encoder_output = encoder_output.permute(1, 0, 2)
+        encoder_output_pooled = encoder_output.mean(dim=1)
 
         """
         Selector
@@ -231,26 +229,25 @@ class TimeSeriesTransformer(nn.Module):
 
         """
         Decoder
-        unsensed_static.shape: (batch_size, num_unsensed, num_static)
+        unsensed_static.shape: (num_unsensed, num_static)
         """
-        batch_size, num_unsensed, _, _ = unsensed_static.shape
-        unsensed_static_embedding = self.mlp(unsensed_static.view(batch_size*num_unsensed, self.num_static))
-        unsensed_static_embedding = unsensed_static_embedding.unsqueeze(1).expand(batch_size, num_unsensed, self.d_model)
-        unsensed_static_embedding_broadcasted = unsensed_static_embedding.unsqueeze(2).expand(batch_size, num_unsensed, self.seq_len, self.d_model)
+        num_unsensed, _ = unsensed_static.shape
+        unsensed_static_embedding = self.mlp(unsensed_static)
+        unsensed_static_embedding_broadcasted = unsensed_static_embedding.unsqueeze(1).expand(num_unsensed, self.seq_len, self.d_model)
 
-        positional_encoding = self.positional_encoder.unsqueeze(0).unsqueeze(0)
-        positional_encoding = positional_encoding.expand(batch_size, num_unsensed, self.seq_len, self.d_model)
+        positional_encoding = self.positional_encoder.unsqueeze(0)
+        positional_encoding = positional_encoding.expand(num_unsensed, self.seq_len, self.d_model)
 
         unsensed_embedding = unsensed_static_embedding_broadcasted + positional_encoding
-
-        unsensed_embedding = unsensed_embedding.reshape(batch_size*num_unsensed, self.seq_len, self.d_attention)
         unsensed_embedding = unsensed_embedding.permute(1, 0, 2)
 
-        decoder_output = self.decoder(unsensed_embedding, encoder_output, encoder_output)
+        query = unsensed_embedding
+        key = encoder_output_pooled.unsqueeze(1).expand(num_sensors, num_unsensed, self.d_model)
+        value = key
+        decoder_output = self.decoder(query, key, value)
 
-        decoder_output - decoder_output.permute(1, 0, 2)
-        decoder_output = decoder_output.reshape(batch_size, num_unsensed, self.seq_len, self.d_model)
-        output = self.output_projection(decoder_output.view(batch_size*num_unsensed*self.seq_len, self.d_model))
-        output = output.view(batch_size, num_unsensed, self.seq_len, self.num_variables)
+        decoder_output = decoder_output.permute(1, 0, 2)
+        output = self.output_projection(decoder_output.reshape(num_unsensed*self.seq_len, self.d_model))
+        output = output.view(num_unsensed, self.seq_len)
 
         return output, selected_indices
