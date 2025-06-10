@@ -2,6 +2,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class MultiheadedAttention(nn.Module):
+    def __init__(self,
+                 d_model,
+                 num_heads,
+                 dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_attention = d_model // num_heads
+        self.dropout = dropout
+
+    def forward(self, query, key, value):
+        n, d_model = query.shape
+        m, d_model = key.shape
+
+        Qh = query.view(n, self.num_heads, self.d_attention).permute(1, 0, 2)
+        Kh = key.view(m, self.num_heads, self.d_attention).permute(1, 0, 2)
+        Vh = value.view(m, self.num_heads, self.d_attention).permute(1, 0, 2)
+
+        attn_scores = torch.matmul(Qh, Kh.transpose(1, 2)) / (self.d_attention ** 0.5)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        context_per_head = torch.matmul(attn_weights, Vh)
+
+        context = context_per_head.permute(1, 0, 2).contiguous().view(n, d_model)
+
+        return context, attn_weights
+
 class TimeSeriesTransformerEncoderLayer(nn.Module):
     def __init__(self,
                  d_model,
@@ -10,38 +38,82 @@ class TimeSeriesTransformerEncoderLayer(nn.Module):
                  dropout):
         super().__init__()
 
-        self.self_attention = nn.MultiheadAttention(embed_dim=d_model,
-                                                    num_heads=num_heads,
-                                                    dropout=dropout,
-                                                    bias=True,
-                                                    batch_first=False)
+        self.query_embedding = nn.Linear(d_model, d_model)
+        self.key_embedding = nn.Linear(d_model, d_model)
+        self.value_embedding = nn.Linear(d_model, d_model)
 
-        # WILL CHANGE TO BATCH NORM
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # self.self_attn = nn.MultiheadAttention(embed_dim=d_model,
+        #                                             num_heads=num_heads,
+        #                                             dropout=dropout,
+        #                                             bias=True,
+        #                                             batch_first=True)
+
+        self.self_attn = MultiheadedAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
+
+        # self.norm1 = nn.LayerNorm(d_model)
+        # self.norm2 = nn.LayerNorm(d_model)
+        self.norm_attn = nn.BatchNorm1d(d_model)
+        self.norm_ffn = nn.BatchNorm1d(d_model)
 
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout)
         )
 
-        self.dropout_attention = nn.Dropout(dropout)
+        self.dropout_attn = nn.Dropout(dropout)
         self.dropout_ffn = nn.Dropout(dropout)
 
     def forward(self, X):
-        attention_output, attention_scores = self.self_attention(query=X, key=X, value=X)
-        dropout1 = self.dropout_attention(attention_output)
-        residual1 = X + dropout1
-        norm1 = self.norm1(residual1)
+        # X: (num_sensed, seq_len, d_model)
+        num_sensed, seq_len, d_model = X.shape
 
-        ffn_output = self.ffn(norm1)
-        dropout2 = self.dropout_ffn(ffn_output)
-        residual2 = norm1 + dropout2
-        norm2 = self.norm2(residual2)
-        return norm2
+        # Compute Query, Key, Value Embeddings
+        query = X.view(num_sensed*seq_len, d_model)
+        query = self.query_embedding(query)
+        key = X.view(num_sensed*seq_len, d_model)
+        key = self.key_embedding(key)
+        value = X.view(num_sensed*seq_len, d_model)
+        value = self.value_embedding(value)
+
+        # Attention Mechanism
+        # attn_output, attn_scores = self.self_attn(query, key, value, need_weights=True, average_attn_weights=True)
+        attn_output, attn_scores = self.self_attn(query, key, value)
+        attn_output = attn_output.view(num_sensed, seq_len, d_model)
+
+        # Dropout + Residual Connection
+        dropout_attn = self.dropout_attn(attn_output)
+        residual_attn = X + dropout_attn
+
+        # Batch Norm
+        residual_attn = residual_attn.view(num_sensed*seq_len, d_model)
+        residual_attn = residual_attn.unsqueeze(0)
+        residual_attn = residual_attn.permute(0, 2, 1)
+        norm_attn = self.norm_attn(residual_attn)
+        norm_attn = norm_attn.permute(0, 2, 1)
+        norm_attn = norm_attn.squeeze(0)
+        norm_attn = norm_attn.view(num_sensed, seq_len, d_model)
+        norm_attn = norm_attn.view(num_sensed*seq_len, d_model)
+
+        # Feed Forward Network
+        ffn_output = self.ffn(norm_attn)
+        ffn_output = ffn_output.view(num_sensed, seq_len, d_model)
+
+        # Dropout + Residual Connection
+        dropout_ffn = self.dropout_ffn(ffn_output)
+        norm_attn = norm_attn.view(num_sensed, seq_len, d_model)
+        residual_ffn = norm_attn + dropout_ffn
+
+        # Batch Norm
+        residual_ffn = residual_ffn.view(num_sensed*seq_len, d_model)
+        residual_ffn = residual_ffn.unsqueeze(0)
+        residual_ffn = residual_ffn.permute(0, 2, 1)
+        norm_ffn = self.norm_ffn(residual_ffn)
+        norm_ffn = norm_ffn.permute(0, 2, 1)
+        norm_ffn = norm_ffn.squeeze(0)
+        norm_ffn = norm_ffn.view(num_sensed, seq_len, d_model)
+        return norm_ffn
     
 class TimeSeriesTransformerEncoder(nn.Module):
     def __init__(self,
@@ -63,15 +135,47 @@ class TimeSeriesTransformerEncoder(nn.Module):
             output = layer(output)
         return output
 
-class Selector(nn.Module):
+class RandomSelector(nn.Module):
     def __init__(self,
                  top_k):
         super().__init__()
         self.top_k = top_k
 
     def forward(self, X):
-        indices = torch.randperm(X.shape[0])[:self.top_k]
+        # X: (num_sensed, seq_len, num_variables)
+        indices = torch.randperm(X.shape[0], device=X.device)[:self.top_k]
         return indices
+    
+class GumbelTopKSelector(nn.Module):
+    def __init__(self,
+                 num_sensors,
+                 top_k,
+                 beta=1.0,
+                 eps=1e-6,
+                 ):
+        super().__init__()
+        self.num_sensors = num_sensors
+        self.top_k = top_k
+        self.beta = beta
+        self.eps = eps
+
+        self.alpha = nn.Parameter(torch.zeros(top_k, num_sensors))
+
+    def sample_gumbel(self, shape, device):
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + self.eps) + self.eps)
+
+    def forward(self, X):
+        G = self.sample_gumbel((self.top_k, self.num_sensors), X.device)
+        log_alpha = torch.log(self.alpha)
+        noisy = (log_alpha + G) / self.beta
+
+        W = torch.softmax(noisy, dim=1)
+        selected_indices = torch.argmax(W, dim=1)
+
+        p = self.alpha / (self.alpha.sum(dim=1, keepdim=True) + self.eps)
+
+        return selected_indices, p
 
 class TimeSeriesTransformerDecoderLayer(nn.Module):
     def __init__(self,
@@ -81,51 +185,77 @@ class TimeSeriesTransformerDecoderLayer(nn.Module):
                  dropout):
         super().__init__()
 
-        self.self_attention = nn.MultiheadAttention(embed_dim=d_model,
-                                                    num_heads=num_heads,
-                                                    dropout=dropout,
-                                                    bias=True,
-                                                    batch_first=False)
-        self.cross_attention = nn.MultiheadAttention(embed_dim=d_model,
-                                                     num_heads=num_heads,
-                                                     dropout=dropout,
-                                                     bias=True,
-                                                     batch_first=False)
+        # self.cross_attn = nn.MultiheadAttention(embed_dim=d_model,
+        #                                              num_heads=num_heads,
+        #                                              dropout=dropout,
+        #                                              bias=True,
+        #                                              batch_first=True)
+        self.cross_attn = MultiheadedAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
         
-        # WILL CHANGE TO BATCH NORM
-        self.norm_self_attention = nn.LayerNorm(d_model)
-        self.norm_cross_attention = nn.LayerNorm(d_model)
-        self.norm_ffn = nn.LayerNorm(d_model)
+        # self.norm_cross_attn = nn.LayerNorm(d_model)
+        # self.norm_ffn = nn.LayerNorm(d_model)
+        self.norm_cross_attn = nn.BatchNorm1d(d_model)
+        self.norm_ffn = nn.BatchNorm1d(d_model)
 
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout)
         )
 
-        self.dropout_self_attention = nn.Dropout(dropout)
-        self.dropout_cross_attention = nn.Dropout(dropout)
+        self.dropout_cross_attn = nn.Dropout(dropout)
         self.dropout_ffn = nn.Dropout(dropout)
 
     def forward(self, Q, K, V):
-        self_attention_output, self_attention_scores = self.self_attention(query=Q, key=Q, value=Q)
-        dropout1 = self.dropout_self_attention(self_attention_output)
-        residual1 = Q + dropout1
-        norm1 = self.norm_self_attention(residual1)
+        # Q: (num_unsensed, seq_len, d_model)
+        # K, V: (num_unsensed, num_sensed, d_model)
+        num_unsensed, seq_len, d_model = Q.shape
+        _, num_sensed, _ = K.shape
 
-        cross_attention_output, cross_attention_scores = self.cross_attention(query=norm1, key=K, value=V)
-        dropout2 = self.dropout_cross_attention(cross_attention_output)
-        residual2 = norm1 + dropout2
-        norm2 = self.norm_cross_attention(residual2)
+        # Reshape Q, K, V for Cross Attention
+        Q = Q.view(num_unsensed*seq_len, d_model)
+        K = K.contiguous().view(num_unsensed*num_sensed, d_model)
+        V = V.contiguous().view(num_unsensed*num_sensed, d_model)
 
-        ffn_output = self.ffn(norm2)
-        dropout3 = self.dropout_ffn(ffn_output)
-        residual3 = norm2 + dropout3
-        norm3 = self.norm_ffn(residual3)
+        # Cross Attention Mechanism
+        # cross_attn_output, cross_attn_scores = self.cross_attn(Q, K, V, need_weights=True, average_attn_weights=True)
+        cross_attn_output, cross_attn_scores = self.cross_attn(Q, K, V)
+        cross_attn_output = cross_attn_output.view(num_unsensed, seq_len, d_model)
 
-        return norm3
+        # Dropout + Residual Connection
+        dropout_attn = self.dropout_cross_attn(cross_attn_output)
+        Q = Q.view(num_unsensed, seq_len, d_model)
+        residual_attn = Q + dropout_attn
+
+        # Batch Norm
+        residual_attn = residual_attn.view(num_unsensed*seq_len, d_model)
+        residual_attn = residual_attn.unsqueeze(0)
+        residual_attn = residual_attn.permute(0, 2, 1)
+        norm_attn = self.norm_cross_attn(residual_attn)
+        norm_attn = norm_attn.permute(0, 2, 1)
+        norm_attn = norm_attn.squeeze(0)
+        norm_attn = norm_attn.view(num_unsensed, seq_len, d_model)
+        norm_attn = norm_attn.view(num_unsensed*seq_len, d_model)
+
+        # Feed Forward Network
+        ffn_output = self.ffn(norm_attn)
+        ffn_output = ffn_output.view(num_unsensed, seq_len, d_model)
+
+        # Dropout + Residual Connection
+        dropout_ffn = self.dropout_ffn(ffn_output)
+        norm_attn = norm_attn.view(num_unsensed, seq_len, d_model)
+        residual_ffn = norm_attn + dropout_ffn
+
+        # Batch Norm
+        residual_ffn = residual_ffn.view(num_unsensed*seq_len, d_model)
+        residual_ffn = residual_ffn.unsqueeze(0)
+        residual_ffn = residual_ffn.permute(0, 2, 1)
+        norm_ffn = self.norm_ffn(residual_ffn)
+        norm_ffn = norm_ffn.permute(0, 2, 1)
+        norm_ffn = norm_ffn.squeeze(0)
+        norm_ffn = norm_ffn.view(num_unsensed, seq_len, d_model)
+        return norm_ffn
     
 class TimeSeriesTransformerDecoder(nn.Module):
     def __init__(self,
@@ -149,14 +279,14 @@ class TimeSeriesTransformerDecoder(nn.Module):
 
 class TimeSeriesTransformer(nn.Module):
     def __init__(self,
-                 d_model: int = 256,
+                 d_model: int = 512,
                  num_variables: int = 6,
                  num_static: int = 2,
                  seq_len: int = 24,
                  num_encoder_layers: int = 6,
                  num_decoder_layers: int = 6,
                  num_heads: int = 8,
-                 d_ff: int = 1024,
+                 d_ff: int = 2048,
                  top_k: int = 50,
                  dropout: float = 0.1):
         super().__init__()
@@ -186,7 +316,7 @@ class TimeSeriesTransformer(nn.Module):
                                                     d_ff=d_ff,
                                                     num_layers=num_encoder_layers,
                                                     dropout=dropout)
-        self.selector = Selector(top_k=top_k)
+        self.selector = GumbelTopKSelector(top_k=top_k)
         self.decoder = TimeSeriesTransformerDecoder(d_model=d_model,
                                                     num_heads=num_heads,
                                                     d_ff=d_ff,
@@ -198,56 +328,61 @@ class TimeSeriesTransformer(nn.Module):
     def forward(self, X, static, unsensed_static):
         """
         Embedding
-        X.shape: (num_sensors, seq_len, num_variables)
-        static.shape: (num_sensors, num_static)
         """
-        num_sensors, _, _ = X.shape
+        # X: (num_sensed, seq_len, num_variables)
+        num_sensed, _, _ = X.shape 
 
-        X_embedding = self.embedding_projection(X.view(num_sensors*self.seq_len, self.num_variables))
-        X_embedding = X_embedding.view(num_sensors, self.seq_len, self.d_model)
+        X = X.view(num_sensed*self.seq_len, self.num_variables)
+        X_embedding = self.embedding_projection(X)
+        X_embedding = X_embedding.view(num_sensed, self.seq_len, self.d_model)
 
+        # static: (num_sensed, num_static)
         static_embedding = self.mlp(static)
-        static_embedding_broadcasted = static_embedding.unsqueeze(1).expand(num_sensors, self.seq_len, self.d_model)
+        static_embedding = static_embedding.unsqueeze(1)
+        static_embedding_broadcasted = static_embedding.expand(num_sensed, self.seq_len, self.d_model)
 
+        # positional_encoder: (seq_len, d_model)
         positional_encoding = self.positional_encoder.unsqueeze(0)
-        positional_encoding = positional_encoding.expand(num_sensors, self.seq_len, self.d_model)
+        positional_encoding = positional_encoding.expand(num_sensed, self.seq_len, self.d_model)
 
         embedding = X_embedding + static_embedding_broadcasted + positional_encoding
-        embedding = embedding.permute(1, 0, 2)
 
         """
         Encoder
         """
         encoder_output = self.encoder(embedding)
-        encoder_output = encoder_output.permute(1, 0, 2)
         encoder_output_pooled = encoder_output.mean(dim=1)
 
         """
         Selector
         """
-        selected_indices = self.selector(X)
+        selector_input = encoder_output_pooled + static_embedding.squeeze(1)
+        selected_indices = self.selector(selector_input)
 
         """
         Decoder
         unsensed_static.shape: (num_unsensed, num_static)
         """
+        # unsensed_static: (num_unsensed, num_static)
         num_unsensed, _ = unsensed_static.shape
+
         unsensed_static_embedding = self.mlp(unsensed_static)
-        unsensed_static_embedding_broadcasted = unsensed_static_embedding.unsqueeze(1).expand(num_unsensed, self.seq_len, self.d_model)
+        unsensed_static_embedding = unsensed_static_embedding.unsqueeze(1)
+        unsensed_static_embedding_broadcasted = unsensed_static_embedding.expand(num_unsensed, self.seq_len, self.d_model)
 
         positional_encoding = self.positional_encoder.unsqueeze(0)
         positional_encoding = positional_encoding.expand(num_unsensed, self.seq_len, self.d_model)
 
         unsensed_embedding = unsensed_static_embedding_broadcasted + positional_encoding
-        unsensed_embedding = unsensed_embedding.permute(1, 0, 2)
 
         query = unsensed_embedding
-        key = encoder_output_pooled.unsqueeze(1).expand(num_sensors, num_unsensed, self.d_model)
+        key = encoder_output_pooled.unsqueeze(0)
+        key = key.expand(num_unsensed, num_sensed, self.d_model)
         value = key
         decoder_output = self.decoder(query, key, value)
 
-        decoder_output = decoder_output.permute(1, 0, 2)
-        output = self.output_projection(decoder_output.reshape(num_unsensed*self.seq_len, self.d_model))
+        output = decoder_output.view(num_unsensed*self.seq_len, self.d_model)
+        output = self.output_projection(output)
         output = output.view(num_unsensed, self.seq_len)
 
         return output, selected_indices
