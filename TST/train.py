@@ -59,9 +59,10 @@ d_ff = 4*d_model
 budget = 10
 top_k = 2
 dropout = 0.1
+eps = torch.finfo(torch.float32).eps
 
 num_epochs = 3
-learning_rate = 1e-4
+learning_rate = 1e-3
 
 model = TimeSeriesTransformer(
     d_model=d_model,
@@ -72,8 +73,10 @@ model = TimeSeriesTransformer(
     num_decoder_layers=num_decoder_layers,
     num_heads=num_heads,
     d_ff=d_ff,
+    num_sensors=budget,
     top_k=top_k,
-    dropout=dropout
+    dropout=dropout,
+    eps=eps
 )
 
 log(f"Model parameters: d_model={d_model}, num_heads={num_heads}, num_variables={num_variables}, "
@@ -85,10 +88,16 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
     model = torch.nn.DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
 model.to(device)
 
-criterion = torch.nn.MSELoss()
+criterion = torch.nn.MSELoss().to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}")
+start_beta = 1.0
+end_beta = 0.05
+start_tau = 5.0
+end_tau = 1.0
+reg_lambda = 0.1
+
+log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}, start_beta={start_beta}, end_beta={end_beta}, start_tau={start_tau}, end_tau={end_tau}, reg_lambda={reg_lambda}")
 
 model.train()
 for epoch in range(num_epochs):
@@ -98,6 +107,9 @@ for epoch in range(num_epochs):
     permute = torch.randperm(data.shape[1])
     sensed_indices = permute[:budget]
     unsensed_indices = permute[budget:]
+
+    beta = start_beta * (end_beta / start_beta) ** (epoch / num_epochs)
+    # tau = start_tau * (end_tau / start_tau) ** (epoch / num_epochs)
 
     for i in range(0, len(train_data)):
         X = torch.tensor(train_data[i, :, :, :])
@@ -110,7 +122,7 @@ for epoch in range(num_epochs):
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
         optimizer.zero_grad()
-        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device))
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
 
         sensed_indices = torch.tensor(sensed_indices, device=indices.device)
         indices = sensed_indices[indices]
@@ -118,6 +130,10 @@ for epoch in range(num_epochs):
         target = torch.tensor(train_data[i, :, :, :])[unsensed_indices, :, 0].to(device)
 
         loss = criterion(output, target)
+        # reg_loss = reg_lambda * torch.relu(torch.sum(p, dim=0) - tau).sum()
+        # print(loss, reg_loss)
+        # loss += reg_loss
+
         loss.backward()
         epoch_loss += loss.item()
         optimizer.step()
@@ -164,6 +180,8 @@ with torch.no_grad():
     sensed_indices = permute[:budget]
     unsensed_indices = permute[budget:]
 
+    beta = end_beta
+
     for i in range(len(test_data)):
         X = torch.tensor(test_data[i, :, :, :])
         X = X[sensed_indices, :, :]
@@ -174,7 +192,7 @@ with torch.no_grad():
         X_unsensed_static = torch.tensor(static)
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
-        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device))
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
 
         sensed_indices = torch.tensor(sensed_indices, device=indices.device)
         indices = sensed_indices[indices]

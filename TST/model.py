@@ -148,34 +148,26 @@ class RandomSelector(nn.Module):
     
 class GumbelTopKSelector(nn.Module):
     def __init__(self,
-                 num_sensors,
                  top_k,
-                 beta=1.0,
                  eps=1e-6,
                  ):
         super().__init__()
-        self.num_sensors = num_sensors
         self.top_k = top_k
-        self.beta = beta
         self.eps = eps
-
-        self.alpha = nn.Parameter(torch.zeros(top_k, num_sensors))
 
     def sample_gumbel(self, shape, device):
         U = torch.rand(shape, device=device)
         return -torch.log(-torch.log(U + self.eps) + self.eps)
 
-    def forward(self, X):
-        G = self.sample_gumbel((self.top_k, self.num_sensors), X.device)
-        log_alpha = torch.log(self.alpha)
-        noisy = (log_alpha + G) / self.beta
+    def forward(self, X, beta):
+        num_sensors = X.size(0)
+        with torch.no_grad():
+            scores = X.mean(dim=1)
+            gumbel = self.sample_gumbel((num_sensors,), X.device)
+            noisy_scores = (scores + gumbel) / beta
+            topk_inds = torch.topk(noisy_scores, self.top_k).indices
 
-        W = torch.softmax(noisy, dim=1)
-        selected_indices = torch.argmax(W, dim=1)
-
-        p = self.alpha / (self.alpha.sum(dim=1, keepdim=True) + self.eps)
-
-        return selected_indices, p
+        return topk_inds
 
 class TimeSeriesTransformerDecoderLayer(nn.Module):
     def __init__(self,
@@ -287,8 +279,10 @@ class TimeSeriesTransformer(nn.Module):
                  num_decoder_layers: int = 6,
                  num_heads: int = 8,
                  d_ff: int = 2048,
+                 num_sensors: int = 100,
                  top_k: int = 50,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 eps: float = 1e-6):
         super().__init__()
         self.d_model = d_model
         self.d_attention = d_model // num_heads
@@ -299,8 +293,10 @@ class TimeSeriesTransformer(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.num_heads = num_heads
         self.d_ff = d_ff
+        self.num_sensors = num_sensors
         self.top_k = top_k
         self.dropout = dropout
+        self.eps = eps
 
         self.embedding_projection = nn.Linear(num_variables, d_model)
         self.mlp = nn.Sequential(
@@ -316,7 +312,7 @@ class TimeSeriesTransformer(nn.Module):
                                                     d_ff=d_ff,
                                                     num_layers=num_encoder_layers,
                                                     dropout=dropout)
-        self.selector = GumbelTopKSelector(top_k=top_k)
+        self.selector = GumbelTopKSelector(top_k=top_k, eps=eps)
         self.decoder = TimeSeriesTransformerDecoder(d_model=d_model,
                                                     num_heads=num_heads,
                                                     d_ff=d_ff,
@@ -325,7 +321,7 @@ class TimeSeriesTransformer(nn.Module):
         
         self.output_projection = nn.Linear(d_model, 1)
 
-    def forward(self, X, static, unsensed_static):
+    def forward(self, X, static, unsensed_static, beta):
         """
         Embedding
         """
@@ -357,7 +353,7 @@ class TimeSeriesTransformer(nn.Module):
         Selector
         """
         selector_input = encoder_output_pooled + static_embedding.squeeze(1)
-        selected_indices = self.selector(selector_input)
+        selected_indices = self.selector(selector_input, beta)
 
         """
         Decoder
