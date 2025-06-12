@@ -3,11 +3,11 @@ import numpy as np
 import os
 from datetime import datetime
 
-from model import TimeSeriesTransformer
+from statistical_gumbel_selector_model import TimeSeriesTransformer
 
 # root = '/users/vmli3/SORS-2025/'
-# log_file = root + 'log.txt'
-# model_path = '/scratch/vmli3/SORS-2025/model.pth'
+# log_file = root + 'statistical_gumbel_selector_log1.txt'
+# model_path = '/scratch/vmli3/SORS-2025/statistical_gumbel_selector_model1.pth'
 
 root = '/Users/victorli/Documents/GitHub/SORS-2025/TST/'
 log_file = root + 'log.txt'
@@ -33,6 +33,7 @@ log(f'Torch device: {device}')
 torch.set_default_dtype(torch.float32)
 
 data = np.load(data_path)
+data = data[:10]
 log(f"Data shape: {data.shape}")
 
 static = np.load(static_path)
@@ -40,7 +41,7 @@ log(f"Static shape: {static.shape}")
 
 null_stations = np.load(null_stations_path)
 log(f"Null stations shape: {null_stations.shape}")
-null_stations_set = set(map(tuple, null_stations))
+null_stations_set = set((int(a), int(b)) for a, b in null_stations)
 
 split_idx = int(0.8 * len(data))
 train_data = data[:split_idx]
@@ -56,7 +57,7 @@ num_encoder_layers = 2
 num_decoder_layers = 2
 d_ff = 4*d_model
 budget = 10
-top_k = 2
+top_k = 5
 dropout = 0.1
 eps = torch.finfo(torch.float32).eps
 
@@ -88,17 +89,12 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
 model.to(device)
 
 criterion = torch.nn.MSELoss().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=eps)
 
 start_beta = 1.0
 end_beta = 0.05
-start_selector_loss_weight = 1.0
-end_selector_loss_weight = 0.1
-# start_tau = 5.0
-# end_tau = 1.0
-reg_lambda = 0.1
 
-log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}, start_beta={start_beta}, end_beta={end_beta}, reg_lambda={reg_lambda}")
+log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}, start_beta={start_beta}, end_beta={end_beta}")
 
 model.train()
 train_start_time = datetime.now()
@@ -107,71 +103,57 @@ for epoch in range(num_epochs):
     epoch_loss = 0.0
 
     permute = torch.randperm(data.shape[1])
-    selected_indices = permute[:budget]
+    sensed_indices = permute[:budget]
     unsensed_indices = permute[budget:]
 
     beta = start_beta * (end_beta / start_beta) ** (epoch / num_epochs)
-    selector_loss_weight = start_selector_loss_weight * (end_selector_loss_weight / start_selector_loss_weight) ** (epoch / num_epochs)
-    # tau = start_tau * (end_tau / start_tau) ** (epoch / num_epochs)
 
     for i in range(0, len(train_data)):
         X = torch.tensor(train_data[i, :, :, :])
-        X = X[selected_indices, :, :]
+        X = X[sensed_indices, :, :]
 
         X_static = torch.tensor(static)
-        X_static = X_static[selected_indices, :]
+        X_static = X_static[sensed_indices, :]
 
         X_unsensed_static = torch.tensor(static)
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
         optimizer.zero_grad()
-        selector_output, output, indices, p = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
 
-        selected_set = set(indices.tolist())
-        unselected_indices = torch.tensor([i for i in range(budget) if i not in selected_set], device=device)
-
-        selected_indices_tensor = torch.tensor(selected_indices, device=device)
-        indices = selected_indices_tensor[indices]
-        unselected_indices = selected_indices_tensor[unselected_indices]
-
-        selector_targets = torch.tensor(train_data[i, :, :, :], device=device)[unselected_indices, :, 0]
-        selector_loss = criterion(selector_output, selector_targets)
-
-        # reg_loss = reg_lambda * torch.relu(torch.sum(p, dim=1) - tau).sum()
-        # selector_loss += reg_loss
-
-        selector_loss = selector_loss_weight * selector_loss
+        sensed_indices = torch.tensor(sensed_indices, device=indices.device)
+        indices = sensed_indices[indices]
 
         target = torch.tensor(train_data[i, :, :, :])[unsensed_indices, :, 0].to(device)
+
         loss = criterion(output, target)
-        loss += selector_loss
+
         loss.backward()
         epoch_loss += loss.item()
         optimizer.step()
 
-        selected_indices_set = set()
-        unsensed_indices_set = set(range(len(static)))
- 
+        sensed_indices = set()
+        unsensed_indices = set(range(len(static)))
         for idx in indices:
             idx = idx.item()
             if (i, idx) not in null_stations_set:
-                selected_indices_set.add(idx)
-                unsensed_indices_set.discard(idx)
+                sensed_indices.add(idx)
+                unsensed_indices.discard(idx)
 
-        for idx in list(unsensed_indices_set):
+        for idx in list(unsensed_indices):
             if (i, idx) in null_stations_set:
-                unsensed_indices_set.discard(idx)
+                unsensed_indices.discard(idx)
 
-        if len(unsensed_indices_set) < budget - len(selected_indices_set):
-            raise Exception(f"Error: fewer than {budget} selected indices, found {len(unsensed_indices_set)} indices remaining and need {budget-len(selected_indices_set)} indices.")
+        if len(unsensed_indices) < budget - len(sensed_indices):
+            raise Exception(f"Error: fewer than {budget} sensed indices, found {len(unsensed_indices)} indices remaining and need {budget-len(sensed_indices)} indices.")
         
-        while len(selected_indices_set) < budget:
-            idx = np.random.choice(list(unsensed_indices_set))
-            selected_indices_set.add(idx)
-            unsensed_indices_set.discard(idx)
+        while len(sensed_indices) < budget:
+            idx = np.random.choice(list(unsensed_indices))
+            sensed_indices.add(idx)
+            unsensed_indices.discard(idx)
 
-        selected_indices = list(selected_indices_set)
-        unsensed_indices = list(unsensed_indices_set)
+        sensed_indices = list(sensed_indices)
+        unsensed_indices = list(unsensed_indices)
 
     log(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss/len(train_data):.8f}, Time: {datetime.now() - start_time}')
 
@@ -190,51 +172,52 @@ with torch.no_grad():
     start_time = datetime.now()
 
     permute = torch.randperm(data.shape[1])
-    selected_indices = permute[:budget]
+    sensed_indices = permute[:budget]
     unsensed_indices = permute[budget:]
 
     beta = end_beta
 
     for i in range(len(test_data)):
         X = torch.tensor(test_data[i, :, :, :])
-        X = X[selected_indices, :, :]
+        X = X[sensed_indices, :, :]
 
         X_static = torch.tensor(static)
-        X_static = X_static[selected_indices, :]
+        X_static = X_static[sensed_indices, :]
 
         X_unsensed_static = torch.tensor(static)
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
-        _, output, indices, _ = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
 
-        selected_indices_tensor = torch.tensor(selected_indices, device=device)
-        indices = selected_indices_tensor[indices]
+        sensed_indices = torch.tensor(sensed_indices, device=indices.device)
+        indices = sensed_indices[indices]
 
-        target = torch.tensor(test_data[i, :, :, :], device=device)[unsensed_indices, :, 0]
+        target = torch.tensor(test_data[i, :, :, :])[unsensed_indices, :, 0].to(device)
 
         loss = criterion(output, target)
         test_loss += loss.item()
 
-        selected_indices_set = set()
+        sensed_indices_set = set()
         unsensed_indices_set = set(range(len(static)))
         for idx in indices:
+            idx = idx.item()
             if (i + split_idx, idx) not in null_stations_set:
-                selected_indices_set.add(idx)
+                sensed_indices_set.add(idx)
                 unsensed_indices_set.discard(idx)
 
         for idx in list(unsensed_indices_set):
             if (i + split_idx, idx) in null_stations_set:
                 unsensed_indices_set.discard(idx)
 
-        if len(unsensed_indices_set) < budget - len(selected_indices_set):
-            raise Exception(f"Error: fewer than {budget} selected indices, found {len(unsensed_indices_set)} indices remaining and need {budget-len(selected_indices_set)} indices.")
+        if len(unsensed_indices_set) < budget - len(sensed_indices_set):
+            raise Exception(f"Error: fewer than {budget} sensed indices, found {len(unsensed_indices_set)} indices remaining and need {budget-len(sensed_indices_set)} indices.")
 
-        while len(selected_indices_set) < budget:
+        while len(sensed_indices_set) < budget:
             idx = np.random.choice(list(unsensed_indices_set))
-            selected_indices_set.add(idx)
+            sensed_indices_set.add(idx)
             unsensed_indices_set.discard(idx)
 
-        selected_indices = list(selected_indices_set)
+        sensed_indices = list(sensed_indices_set)
         unsensed_indices = list(unsensed_indices_set)
 
 average_test_loss = test_loss / len(test_data)

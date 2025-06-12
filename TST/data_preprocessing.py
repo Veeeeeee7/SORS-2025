@@ -68,6 +68,10 @@ print(f"data.shape: {data.shape}")
 data_flat = data.reshape(len(station_ids), 365*24, 6)
 data_windowed = sliding_window_view(data_flat, window_shape=24, axis=1)
 data_windowed = data_windowed.transpose(1, 0, 3, 2).copy()
+
+invalid_samples = [6612, 6613, 6614, 6615]
+data_windowed = np.delete(data_windowed, invalid_samples, axis=0)
+
 original_data_windowed = data_windowed.copy()
 
 print(f"data_windowed.shape: {data_windowed.shape}")

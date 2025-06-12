@@ -170,24 +170,20 @@ class StatisticalGumbelTopKSelector(nn.Module):
         return topk_inds
 
 class AlphaGumbelTopkSelector(nn.Module):
-    """
-    Scales each sensor embedding by a learnable alpha, does
-    straight-through Gumbel-TopK, builds a mask, and applies it.
-    """
     def __init__(self, num_sensors: int, top_k: int, eps: float = 1e-6):
         super().__init__()
         self.num_sensors = num_sensors
-        self.top_k       = top_k
-        self.eps         = eps
+        self.top_k = top_k
+        self.eps = eps
 
-        self.alpha       = nn.Parameter(torch.rand(num_sensors, top_k))
+        self.alpha = nn.Parameter(torch.rand(num_sensors, top_k) + eps)
 
     def sample_gumbel(self, shape, device):
         U = torch.rand(shape, device=device)
         return -torch.log(-torch.log(U + self.eps) + self.eps)
 
     def forward(self, X, beta):
-        log_alpha = torch.log(self.alpha + self.eps)
+        log_alpha = torch.log(F.softplus(self.alpha, beta=50.0) + self.eps)
         gumbel = self.sample_gumbel((self.num_sensors, self.top_k), X.device)
         noisy_scores = (log_alpha + gumbel) / beta
         W = torch.softmax(noisy_scores, dim=0)
@@ -195,6 +191,14 @@ class AlphaGumbelTopkSelector(nn.Module):
 
         p = self.alpha / (torch.sum(self.alpha, dim=0) + self.eps)
         p_t = p.t()
+
+        # remove negative values
+        p_t = F.relu(p_t)
+
+        # renormalize for a probability distribution
+        row_sums = p_t.sum(dim=-1, keepdim=True)
+        p_t = p_t / (row_sums + self.eps)
+
         indices = torch.multinomial(p_t, num_samples=1).squeeze(-1)
 
         return Z, indices, p
@@ -384,12 +388,12 @@ class TimeSeriesTransformer(nn.Module):
         """
         selector_input = encoder_output_pooled + static_embedding.squeeze(1)
         masked_encoder_embeddings, selected_sensors, p = self.selector(selector_input, beta)
+        # print(f"selected_sensors.shape: {selected_sensors.shape}")
         # masked_encoder_embeddings: (num_sensed, d_model)
 
         if self.training:
-            num_sensors = num_sensed
-            all_ids = torch.arange(num_sensors, device=masked_encoder_embeddings.device)
-            mask = torch.ones(num_sensors, dtype=torch.bool, device=masked_encoder_embeddings.device)
+            all_ids = torch.arange(num_sensed, device=masked_encoder_embeddings.device)
+            mask = torch.ones(num_sensed, dtype=torch.bool, device=masked_encoder_embeddings.device)
             mask[selected_sensors] = False
 
             unselected_indices = all_ids[mask]
@@ -399,7 +403,11 @@ class TimeSeriesTransformer(nn.Module):
             unselected_indices.shape: (num_unselected, d_model)
             """
             num_unselected = unselected_indices.shape[0]
-            unselected_static = unsensed_static[unselected_indices, :]
+            # print(f"unselected_indices.shape: {unselected_indices.shape}")
+            # print(f"unselected_indices.min: {unselected_indices.min().item()}")
+            # print(f"unselected_indices.max: {unselected_indices.max().item()}")
+            # print(f"static.shape: {static.shape}")
+            unselected_static = static[unselected_indices, :]
             unselected_static_embedding = self.mlp(unselected_static)
             unselected_static_embedding = unselected_static_embedding.unsqueeze(1)
             unselected_static_embedding_broadcasted = unselected_static_embedding.expand(num_unselected, self.seq_len, self.d_model)

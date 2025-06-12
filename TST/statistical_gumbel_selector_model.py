@@ -169,36 +169,6 @@ class StatisticalGumbelTopKSelector(nn.Module):
 
         return topk_inds
 
-class AlphaGumbelTopkSelector(nn.Module):
-    """
-    Scales each sensor embedding by a learnable alpha, does
-    straight-through Gumbel-TopK, builds a mask, and applies it.
-    """
-    def __init__(self, num_sensors: int, top_k: int, eps: float = 1e-6):
-        super().__init__()
-        self.num_sensors = num_sensors
-        self.top_k       = top_k
-        self.eps         = eps
-
-        self.alpha       = nn.Parameter(torch.rand(num_sensors, top_k))
-
-    def sample_gumbel(self, shape, device):
-        U = torch.rand(shape, device=device)
-        return -torch.log(-torch.log(U + self.eps) + self.eps)
-
-    def forward(self, X, beta):
-        log_alpha = torch.log(self.alpha + self.eps)
-        gumbel = self.sample_gumbel((self.num_sensors, self.top_k), X.device)
-        noisy_scores = (log_alpha + gumbel) / beta
-        W = torch.softmax(noisy_scores, dim=0)
-        Z = torch.matmul(W.transpose(1, 0), X)
-
-        p = self.alpha / (torch.sum(self.alpha, dim=0) + self.eps)
-        p_t = p.t()
-        indices = torch.multinomial(p_t, num_samples=1).squeeze(-1)
-
-        return Z, indices, p
-
 class TimeSeriesTransformerDecoderLayer(nn.Module):
     def __init__(self,
                  d_model,
@@ -342,7 +312,7 @@ class TimeSeriesTransformer(nn.Module):
                                                     d_ff=d_ff,
                                                     num_layers=num_encoder_layers,
                                                     dropout=dropout)
-        self.selector = AlphaGumbelTopkSelector(num_sensors=num_sensors, top_k=top_k, eps=eps)
+        self.selector = StatisticalGumbelTopKSelector(top_k=top_k, eps=eps)
         self.decoder = TimeSeriesTransformerDecoder(d_model=d_model,
                                                     num_heads=num_heads,
                                                     d_ff=d_ff,
@@ -383,43 +353,10 @@ class TimeSeriesTransformer(nn.Module):
         Selector
         """
         selector_input = encoder_output_pooled + static_embedding.squeeze(1)
-        masked_encoder_embeddings, selected_sensors, p = self.selector(selector_input, beta)
-        # masked_encoder_embeddings: (num_sensed, d_model)
-
-        if self.training:
-            num_sensors = num_sensed
-            all_ids = torch.arange(num_sensors, device=masked_encoder_embeddings.device)
-            mask = torch.ones(num_sensors, dtype=torch.bool, device=masked_encoder_embeddings.device)
-            mask[selected_sensors] = False
-
-            unselected_indices = all_ids[mask]
-
-            """
-            Decoder for unselected_indices
-            unselected_indices.shape: (num_unselected, d_model)
-            """
-            num_unselected = unselected_indices.shape[0]
-            unselected_static = unsensed_static[unselected_indices, :]
-            unselected_static_embedding = self.mlp(unselected_static)
-            unselected_static_embedding = unselected_static_embedding.unsqueeze(1)
-            unselected_static_embedding_broadcasted = unselected_static_embedding.expand(num_unselected, self.seq_len, self.d_model)
-            selector_positional_encoding = self.positional_encoder.unsqueeze(0)
-            selector_positional_encoding = selector_positional_encoding.expand(num_unselected, self.seq_len, self.d_model)
-            unselected_embedding = unselected_static_embedding_broadcasted + selector_positional_encoding
-            selector_query = unselected_embedding
-            selector_key = masked_encoder_embeddings.unsqueeze(0)
-            selector_key = selector_key.expand(num_unselected, self.top_k, self.d_model)
-            selector_value = selector_key
-            selector_decoder_output = self.decoder(selector_query, selector_key, selector_value)
-            selector_output = selector_decoder_output.view(num_unselected*self.seq_len, self.d_model)
-            selector_output = self.output_projection(selector_output)
-            selector_output = selector_output.view(num_unselected, self.seq_len)
-        else:
-            selector_output = None
-            p = None
+        selected_indices = self.selector(selector_input, beta)
 
         """
-        Decoder for unsensed_indices 
+        Decoder
         unsensed_static.shape: (num_unsensed, num_static)
         """
         # unsensed_static: (num_unsensed, num_static)
@@ -444,4 +381,4 @@ class TimeSeriesTransformer(nn.Module):
         output = self.output_projection(output)
         output = output.view(num_unsensed, self.seq_len)
 
-        return selector_output, output, selected_sensors, p
+        return output, selected_indices

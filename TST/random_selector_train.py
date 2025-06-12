@@ -3,11 +3,11 @@ import numpy as np
 import os
 from datetime import datetime
 
-from model import TimeSeriesTransformer
+from random_selector_model import TimeSeriesTransformer
 
 # root = '/users/vmli3/SORS-2025/'
-# log_file = root + 'log.txt'
-# model_path = '/scratch/vmli3/SORS-2025/model.pth'
+# log_file = root + 'random_selector_log1.txt'
+# model_path = '/scratch/vmli3/SORS-2025/random_selector_model1.pth'
 
 root = '/Users/victorli/Documents/GitHub/SORS-2025/TST/'
 log_file = root + 'log.txt'
@@ -33,6 +33,7 @@ log(f'Torch device: {device}')
 torch.set_default_dtype(torch.float32)
 
 data = np.load(data_path)
+data = data[:10]
 log(f"Data shape: {data.shape}")
 
 static = np.load(static_path)
@@ -40,7 +41,7 @@ log(f"Static shape: {static.shape}")
 
 null_stations = np.load(null_stations_path)
 log(f"Null stations shape: {null_stations.shape}")
-null_stations_set = set(map(tuple, null_stations))
+null_stations_set = set((int(a), int(b)) for a, b in null_stations)
 
 split_idx = int(0.8 * len(data))
 train_data = data[:split_idx]
@@ -56,7 +57,7 @@ num_encoder_layers = 2
 num_decoder_layers = 2
 d_ff = 4*d_model
 budget = 10
-top_k = 2
+top_k = 5
 dropout = 0.1
 eps = torch.finfo(torch.float32).eps
 
@@ -88,17 +89,9 @@ if torch.cuda.is_available() and torch.cuda.device_count() > 1:
 model.to(device)
 
 criterion = torch.nn.MSELoss().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=eps)
 
-start_beta = 1.0
-end_beta = 0.05
-start_selector_loss_weight = 1.0
-end_selector_loss_weight = 0.1
-# start_tau = 5.0
-# end_tau = 1.0
-reg_lambda = 0.1
-
-log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}, start_beta={start_beta}, end_beta={end_beta}, reg_lambda={reg_lambda}")
+log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}")
 
 model.train()
 train_start_time = datetime.now()
@@ -109,10 +102,6 @@ for epoch in range(num_epochs):
     permute = torch.randperm(data.shape[1])
     selected_indices = permute[:budget]
     unsensed_indices = permute[budget:]
-
-    beta = start_beta * (end_beta / start_beta) ** (epoch / num_epochs)
-    selector_loss_weight = start_selector_loss_weight * (end_selector_loss_weight / start_selector_loss_weight) ** (epoch / num_epochs)
-    # tau = start_tau * (end_tau / start_tau) ** (epoch / num_epochs)
 
     for i in range(0, len(train_data)):
         X = torch.tensor(train_data[i, :, :, :])
@@ -125,26 +114,13 @@ for epoch in range(num_epochs):
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
         optimizer.zero_grad()
-        selector_output, output, indices, p = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
-
-        selected_set = set(indices.tolist())
-        unselected_indices = torch.tensor([i for i in range(budget) if i not in selected_set], device=device)
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device))
 
         selected_indices_tensor = torch.tensor(selected_indices, device=device)
         indices = selected_indices_tensor[indices]
-        unselected_indices = selected_indices_tensor[unselected_indices]
-
-        selector_targets = torch.tensor(train_data[i, :, :, :], device=device)[unselected_indices, :, 0]
-        selector_loss = criterion(selector_output, selector_targets)
-
-        # reg_loss = reg_lambda * torch.relu(torch.sum(p, dim=1) - tau).sum()
-        # selector_loss += reg_loss
-
-        selector_loss = selector_loss_weight * selector_loss
 
         target = torch.tensor(train_data[i, :, :, :])[unsensed_indices, :, 0].to(device)
         loss = criterion(output, target)
-        loss += selector_loss
         loss.backward()
         epoch_loss += loss.item()
         optimizer.step()
@@ -193,8 +169,6 @@ with torch.no_grad():
     selected_indices = permute[:budget]
     unsensed_indices = permute[budget:]
 
-    beta = end_beta
-
     for i in range(len(test_data)):
         X = torch.tensor(test_data[i, :, :, :])
         X = X[selected_indices, :, :]
@@ -205,7 +179,7 @@ with torch.no_grad():
         X_unsensed_static = torch.tensor(static)
         X_unsensed_static = X_unsensed_static[unsensed_indices, :]
 
-        _, output, indices, _ = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
+        output, indices = model(X.to(device), X_static.to(device), X_unsensed_static.to(device))
 
         selected_indices_tensor = torch.tensor(selected_indices, device=device)
         indices = selected_indices_tensor[indices]
@@ -218,6 +192,7 @@ with torch.no_grad():
         selected_indices_set = set()
         unsensed_indices_set = set(range(len(static)))
         for idx in indices:
+            idx = idx.item()
             if (i + split_idx, idx) not in null_stations_set:
                 selected_indices_set.add(idx)
                 unsensed_indices_set.discard(idx)
