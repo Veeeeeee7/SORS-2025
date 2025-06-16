@@ -312,6 +312,7 @@ class TimeSeriesTransformer(nn.Module):
                                                     d_ff=d_ff,
                                                     num_layers=num_encoder_layers,
                                                     dropout=dropout)
+        self.encoder_output_projection = nn.Linear(seq_len, 1)
         self.selector = StatisticalGumbelTopKSelector(top_k=top_k, eps=eps)
         self.decoder = TimeSeriesTransformerDecoder(d_model=d_model,
                                                     num_heads=num_heads,
@@ -347,7 +348,10 @@ class TimeSeriesTransformer(nn.Module):
         Encoder
         """
         encoder_output = self.encoder(embedding)
-        encoder_output_pooled = encoder_output.mean(dim=1)
+        encoder_output = encoder_output.contiguous().view(num_sensed*self.d_model, self.seq_len)
+        encoder_output = self.encoder_output_projection(encoder_output)
+        encoder_output_pooled = encoder_output.view(num_sensed, self.d_model)
+        # encoder_output_pooled = encoder_output.mean(dim=1)
 
         """
         Selector
