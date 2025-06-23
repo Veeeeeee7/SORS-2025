@@ -28,7 +28,7 @@ class MultiheadedAttention(nn.Module):
 
         context = context_per_head.permute(1, 0, 2).contiguous().view(n, d_model)
 
-        return context, attn_weights
+        return context, attn_scores
 
 class TimeSeriesTransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -113,7 +113,7 @@ class TimeSeriesTransformerEncoderLayer(nn.Module):
         norm_ffn = norm_ffn.permute(0, 2, 1)
         norm_ffn = norm_ffn.squeeze(0)
         norm_ffn = norm_ffn.view(num_sensed, seq_len, d_model)
-        return norm_ffn
+        return norm_ffn, attn_scores
     
 class TimeSeriesTransformerEncoder(nn.Module):
     def __init__(self,
@@ -132,8 +132,8 @@ class TimeSeriesTransformerEncoder(nn.Module):
     def forward(self, X):
         output = X
         for layer in self.layers:
-            output = layer(output)
-        return output
+            output, attn_scores = layer(output)
+        return output, attn_scores
 
 class RandomSelector(nn.Module):
     def __init__(self,
@@ -146,6 +146,50 @@ class RandomSelector(nn.Module):
         indices = torch.randperm(X.shape[0], device=X.device)[:self.top_k]
         return indices
     
+class SparsemaxSelector(nn.Module):
+    def __init__(self, num_sensors: int, top_k: int, eps: float = 1e-6):
+        super().__init__()
+        self.num_sensors = num_sensors
+        self.top_k = top_k
+        self.eps = eps
+        # we can't learn weights because the outputs aren't "used" in the current training loop and gradients wont propagate to these weights
+        # we will use the attention scores outputed from the encoder as the weights
+        # self.weights = nn.Parameter(torch.randn(num_sensors))  # Learnable scores
+
+    # def sparsemax(self, z: torch.Tensor) -> torch.Tensor:
+    #     # Sparsemax implementation (simplified)
+    #     z_sorted, _ = torch.sort(z, descending=True)
+    #     cumsum = torch.cumsum(z_sorted, dim=0)
+    #     k = torch.arange(1, len(z) + 1, device=z.device)
+    #     threshold = (z_sorted - (cumsum - 1) / k) > 0
+    #     k_z = torch.sum(threshold.float())
+    #     tau_z = (cumsum[k_z - 1] - 1) / k_z
+    #     return torch.clamp(z - tau_z, min=0)
+
+    # errors in original sparsemax, using chatgpt fixes below
+    # @Carson can you check for mathematical accuracy
+    def sparsemax(self, z: torch.Tensor) -> torch.Tensor:
+        # 1) sort z descending
+        z_sorted, _ = torch.sort(z, descending=True)
+        # 2) cumulative sums
+        cumsum = torch.cumsum(z_sorted, dim=0)
+        # 3) arange k = 1…n (float for the div)
+        k = torch.arange(1, z.numel()+1, device=z.device, dtype=z.dtype)
+        # 4) find how many entries satisfy the threshold
+        threshold = (z_sorted - (cumsum - 1) / k) > 0
+        k_z = int(threshold.sum().item())    # now a Python int
+        # 5) compute τ
+        tau_z = (cumsum[k_z - 1] - 1) / k_z
+        # 6) clamp
+        return torch.clamp(z - tau_z, min=0.0)
+
+
+    def forward(self, scores: torch.Tensor, beta: float = 1.0):
+        # scores = self.weights * X.mean(dim=1)  # Combine learned weights + input
+        probs = self.sparsemax(scores / beta)  # Apply sparsemax
+        indices = torch.topk(probs, self.top_k).indices  # Select top-k indices
+        return indices
+
 class StatisticalGumbelTopKSelector(nn.Module):
     def __init__(self,
                  top_k,
@@ -168,36 +212,6 @@ class StatisticalGumbelTopKSelector(nn.Module):
             topk_inds = torch.topk(noisy_scores, self.top_k).indices
 
         return topk_inds
-
-class AlphaGumbelTopkSelector(nn.Module):
-    """
-    Scales each sensor embedding by a learnable alpha, does
-    straight-through Gumbel-TopK, builds a mask, and applies it.
-    """
-    def __init__(self, num_sensors: int, top_k: int, eps: float = 1e-6):
-        super().__init__()
-        self.num_sensors = num_sensors
-        self.top_k       = top_k
-        self.eps         = eps
-
-        self.alpha       = nn.Parameter(torch.rand(num_sensors, top_k))
-
-    def sample_gumbel(self, shape, device):
-        U = torch.rand(shape, device=device)
-        return -torch.log(-torch.log(U + self.eps) + self.eps)
-
-    def forward(self, X, beta):
-        log_alpha = torch.log(self.alpha + self.eps)
-        gumbel = self.sample_gumbel((self.num_sensors, self.top_k), X.device)
-        noisy_scores = (log_alpha + gumbel) / beta
-        W = torch.softmax(noisy_scores, dim=0)
-        Z = torch.matmul(W.transpose(1, 0), X)
-
-        p = self.alpha / (torch.sum(self.alpha, dim=0) + self.eps)
-        p_t = p.t()
-        indices = torch.multinomial(p_t, num_samples=1).squeeze(-1)
-
-        return Z, indices, p
 
 class TimeSeriesTransformerDecoderLayer(nn.Module):
     def __init__(self,
@@ -342,7 +356,8 @@ class TimeSeriesTransformer(nn.Module):
                                                     d_ff=d_ff,
                                                     num_layers=num_encoder_layers,
                                                     dropout=dropout)
-        self.selector = AlphaGumbelTopkSelector(num_sensors=num_sensors, top_k=top_k, eps=eps)
+        self.encoder_output_projection = nn.Linear(seq_len, 1)
+        self.selector = SparsemaxSelector(num_sensors=num_sensors, top_k=top_k, eps=eps)
         self.decoder = TimeSeriesTransformerDecoder(d_model=d_model,
                                                     num_heads=num_heads,
                                                     d_ff=d_ff,
@@ -376,50 +391,24 @@ class TimeSeriesTransformer(nn.Module):
         """
         Encoder
         """
-        encoder_output = self.encoder(embedding)
-        encoder_output_pooled = encoder_output.mean(dim=1)
+        encoder_output, attn_scores = self.encoder(embedding)
+        encoder_output = encoder_output.contiguous().view(num_sensed*self.d_model, self.seq_len)
+        encoder_output = self.encoder_output_projection(encoder_output)
+        encoder_output_pooled = encoder_output.view(num_sensed, self.d_model)
+        # encoder_output_pooled = encoder_output.mean(dim=1)
 
         """
         Selector
         """
-        selector_input = encoder_output_pooled + static_embedding.squeeze(1)
-        masked_encoder_embeddings, selected_sensors, p = self.selector(selector_input, beta)
-        # masked_encoder_embeddings: (num_sensed, d_model)
+        selector_input = attn_scores.mean(dim=0) # average attn scores across heads
+        selector_input = selector_input.mean(dim=0) # since self attention --> (n,n) scores, average down to (n,)
+        selector_input = selector_input.view(num_sensed, self.seq_len) # bring back to (num_sensed, seq_len) from attention shape
+        selector_input = selector_input.mean(dim=1) # average across seq_len to get (num_sensed,)
 
-        if self.training:
-            num_sensors = num_sensed
-            all_ids = torch.arange(num_sensors, device=masked_encoder_embeddings.device)
-            mask = torch.ones(num_sensors, dtype=torch.bool, device=masked_encoder_embeddings.device)
-            mask[selected_sensors] = False
-
-            unselected_indices = all_ids[mask]
-
-            """
-            Decoder for unselected_indices
-            unselected_indices.shape: (num_unselected, d_model)
-            """
-            num_unselected = unselected_indices.shape[0]
-            unselected_static = unsensed_static[unselected_indices, :]
-            unselected_static_embedding = self.mlp(unselected_static)
-            unselected_static_embedding = unselected_static_embedding.unsqueeze(1)
-            unselected_static_embedding_broadcasted = unselected_static_embedding.expand(num_unselected, self.seq_len, self.d_model)
-            selector_positional_encoding = self.positional_encoder.unsqueeze(0)
-            selector_positional_encoding = selector_positional_encoding.expand(num_unselected, self.seq_len, self.d_model)
-            unselected_embedding = unselected_static_embedding_broadcasted + selector_positional_encoding
-            selector_query = unselected_embedding
-            selector_key = masked_encoder_embeddings.unsqueeze(0)
-            selector_key = selector_key.expand(num_unselected, self.top_k, self.d_model)
-            selector_value = selector_key
-            selector_decoder_output = self.decoder(selector_query, selector_key, selector_value)
-            selector_output = selector_decoder_output.view(num_unselected*self.seq_len, self.d_model)
-            selector_output = self.output_projection(selector_output)
-            selector_output = selector_output.view(num_unselected, self.seq_len)
-        else:
-            selector_output = None
-            p = None
+        selected_indices = self.selector(selector_input, beta=beta)
 
         """
-        Decoder for unsensed_indices 
+        Decoder
         unsensed_static.shape: (num_unsensed, num_static)
         """
         # unsensed_static: (num_unsensed, num_static)
@@ -444,4 +433,4 @@ class TimeSeriesTransformer(nn.Module):
         output = self.output_projection(output)
         output = output.view(num_unsensed, self.seq_len)
 
-        return selector_output, output, selected_sensors, p
+        return output, selected_indices

@@ -387,7 +387,6 @@ class TimeSeriesTransformer(nn.Module):
         encoder_output_pooled = encoder_output.view(num_sensed, self.d_model)
         # encoder_output_pooled = encoder_output.mean(dim=1)
 
-
         """
         Selector
         """
