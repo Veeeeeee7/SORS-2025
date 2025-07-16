@@ -1,10 +1,10 @@
-Log started at 2025-06-12 15:39:26.274081
+Log started at 2025-07-16 11:12:17.046484
 Torch device: cpu
 Data shape: (10, 437, 24, 6)
 Static shape: (437, 2)
 Null stations shape: (749443, 2)
 Train samples: 8, Test samples: 2
-Model parameters: d_model=16, num_heads=8, num_variables=6, num_static=2, seq_len=24, num_encoder_layers=2, num_decoder_layers=2, d_ff=64, budget=10, top_k=2, dropout=0.1
+Model parameters: d_model=32, num_heads=8, num_variables=6, num_static=2, seq_len=24, num_encoder_layers=2, num_decoder_layers=2, d_ff=128, budget=25, top_k=8, dropout=0.1, patch_len=6
 Training parameters: num_epochs=3, learning_rate=0.001, criterion=MSELoss(), optimizer=Adam (
 Parameter Group 0
     amsgrad: False
@@ -12,7 +12,7 @@ Parameter Group 0
     capturable: False
     decoupled_weight_decay: False
     differentiable: False
-    eps: 1e-08
+    eps: 1.1920928955078125e-07
     foreach: None
     fused: None
     lr: 0.001
