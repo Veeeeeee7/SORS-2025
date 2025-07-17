@@ -408,22 +408,19 @@ class TimeSeriesTransformer(nn.Module):
         # selector_input = encoder_output.mean(dim=2)  # (num_sensed, num_patches)
         selector_input = encoder_output
 
-
         """
         Selector
         """
-        masked_encoder_embeddings = torch.zeros(num_sensed, self.num_patches, self.d_model, device=encoder_output.device)
+        masked_encoder_embeddings = torch.zeros(self.k_per_patch, self.num_patches, self.d_model, device=encoder_output.device)
         selected_sensors = torch.zeros(self.num_patches, self.k_per_patch, device=encoder_output.device, dtype=torch.int)
         for patch in range(self.num_patches):
             selector = self.patch_selectors[patch]
             selector_input_patch = selector_input[:, patch]
-            print(f"selector_input_patch.shape: {selector_input_patch.shape}")
             patch_masked_encoder_embeddings, patch_selected_sensors, _ = selector(selector_input_patch, beta)
-            print(f"patch_masked_encoder_embeddings.shape: {patch_masked_encoder_embeddings.shape}")
-            print(f"patch_selected_sensors.shape: {patch_selected_sensors.shape}")
             masked_encoder_embeddings[:, patch, :] = patch_masked_encoder_embeddings
             selected_sensors[patch, :] = patch_selected_sensors
-            
+        
+        selected_sensors = selected_sensors.flatten()
 
         if self.training:
             all_ids = torch.arange(num_sensed, device=masked_encoder_embeddings.device)
@@ -451,9 +448,9 @@ class TimeSeriesTransformer(nn.Module):
 
             selector_output = torch.zeros(num_unselected, self.seq_len, device=masked_encoder_embeddings.device)
             for patch in range(self.num_patches):
-                patch_selector_query = unselected_embedding[:, patch*self.patch_len:(patch+1)*self.patch_len, :]
+                patch_selector_query = unselected_embedding[:, patch*self.patch_len:(patch+1)*self.patch_len, :].contiguous()
                 patch_selector_key = masked_encoder_embeddings[:, patch, :].unsqueeze(0)
-                patch_selector_key = patch_selector_key.expand(num_unselected, self.k_per_patch, self.d_model)
+                patch_selector_key = patch_selector_key.expand(num_unselected, self.k_per_patch, self.d_model).contiguous()
                 patch_selector_value = patch_selector_key
                 patch_selector_decoder_output = self.decoder(patch_selector_query, patch_selector_key, patch_selector_value)
                 patch_selector_output = patch_selector_decoder_output.view(num_unselected*self.patch_len, self.d_model)
@@ -483,9 +480,9 @@ class TimeSeriesTransformer(nn.Module):
 
         output = torch.zeros(num_unsensed, self.seq_len, device=masked_encoder_embeddings.device)
         for patch in range(self.num_patches):
-            patch_selector_query = unsensed_embedding[:, patch*self.patch_len:(patch+1)*self.patch_len, :]
+            patch_selector_query = unsensed_embedding[:, patch*self.patch_len:(patch+1)*self.patch_len, :].contiguous()
             patch_selector_key = encoder_output[:, patch, :].unsqueeze(0)
-            patch_selector_key = patch_selector_key.expand(num_unsensed, num_sensed, self.d_model)
+            patch_selector_key = patch_selector_key.expand(num_unsensed, self.num_sensors, self.d_model).contiguous()
             patch_selector_value = patch_selector_key
             patch_decoder_output = self.decoder(patch_selector_query, patch_selector_key, patch_selector_value)
             patch_output = patch_decoder_output.view(num_unsensed*self.patch_len, self.d_model)
