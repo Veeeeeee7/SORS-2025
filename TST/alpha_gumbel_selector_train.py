@@ -13,9 +13,9 @@ model_path = '/scratch/vmli3/SORS-2025/alpha_gumbel_selector_model1.pth'
 # log_file = root + 'log.txt'
 # model_path = '/Users/victorli/Documents/GitHub/SORS-2025/TST/model.pth'
 
-data_path = root + 'data/data_windowed.npy'
-static_path = root + 'data/static.npy'
-null_stations_path = root + 'data/null_stations.npy'
+data_path = root + 'data/stbernard_data_filled.npy'
+static_path = root + 'data/stbernard_static.npy'
+null_stations_path = root + 'data/stbernard_null_set.npy'
 
 def log(message):
     with open(log_file, 'a') as f:
@@ -51,16 +51,20 @@ train_tensor  = torch.from_numpy(train_data).float().to(device)   # (N_train, S,
 test_tensor   = torch.from_numpy(test_data).float().to(device)    # (N_test,  S, L, F)
 static_tensor = torch.from_numpy(static).float().to(device)  # (S, static_feats)
 
+train_tensor = torch.nan_to_num(train_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+test_tensor = torch.nan_to_num(test_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+static_tensor = torch.nan_to_num(static_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
 d_model = 128
 num_heads = 8
-num_variables = 6
+num_variables = 4
 num_static = 2
 seq_len = 24
 num_encoder_layers = 6
 num_decoder_layers = 6
 d_ff = 4*d_model
-budget = 25
-top_k = 10
+budget = 12
+top_k = 4
 dropout = 0.1
 eps = torch.finfo(torch.float32).eps
 
@@ -103,7 +107,7 @@ end_selector_loss_weight = 0.1
 reg_lambda = 0.1
 
 log(f"Training parameters: num_epochs={num_epochs}, learning_rate={learning_rate}, criterion={criterion}, optimizer={optimizer}, start_beta={start_beta}, end_beta={end_beta}, start_selector_loss_weight={start_selector_loss_weight}, end_selector_loss_weight={end_selector_loss_weight} reg_lambda={reg_lambda}")
-MIN_LOSS = 0
+MIN_LOSS = 100
 MIN_EPOCH = 0
 for epoch in range(num_epochs):
     model.train()

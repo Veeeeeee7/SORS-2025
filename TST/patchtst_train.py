@@ -3,19 +3,19 @@ import torch
 import numpy as np
 from datetime import datetime
 
-from patchtst_model import TimeSeriesTransformer
+from patch_model import TimeSeriesTransformer
 
-# root = '/users/vmli3/SORS-2025/'
-# log_file = root + 'alpha_gumbel_selector_log1.txt'
-# model_path = '/scratch/vmli3/SORS-2025/alpha_gumbel_selector_model1.pth'
+root = '/users/vmli3/SORS-2025/'
+log_file = root + 'patch1.txt'
+model_path = '/scratch/vmli3/SORS-2025/patch1.pth'
 
-root = '/Users/victorli/Documents/GitHub/SORS-2025/TST/'
-log_file = root + 'log.txt'
-model_path = '/Users/victorli/Documents/GitHub/SORS-2025/TST/model.pth'
+# root = '/Users/victorli/Documents/GitHub/SORS-2025/TST/'
+# log_file = root + 'log.txt'
+# model_path = '/Users/victorli/Documents/GitHub/SORS-2025/TST/model.pth'
 
-data_path = root + 'data/data_windowed.npy'
-static_path = root + 'data/static.npy'
-null_stations_path = root + 'data/null_stations.npy'
+data_path = root + 'data/stbernard_data_filled.npy'
+static_path = root + 'data/stbernard_static.npy'
+null_stations_path = root + 'data/stbernard_null_set.npy'
 
 def log(message):
     with open(log_file, 'a') as f:
@@ -33,7 +33,6 @@ log(f'Torch device: {device}')
 torch.set_default_dtype(torch.float32)
 
 data = np.load(data_path)
-data = data[:10]
 log(f"Data shape: {data.shape}")
 
 static = np.load(static_path)
@@ -52,21 +51,25 @@ train_tensor  = torch.from_numpy(train_data).float().to(device)   # (N_train, S,
 test_tensor   = torch.from_numpy(test_data).float().to(device)    # (N_test,  S, L, F)
 static_tensor = torch.from_numpy(static).float().to(device)  # (S, static_feats)
 
-d_model = 32
+train_tensor = torch.nan_to_num(train_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+test_tensor = torch.nan_to_num(test_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+static_tensor = torch.nan_to_num(static_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+d_model = 128
 num_heads = 8
-num_variables = 6
+num_variables = 4
 num_static = 2
 seq_len = 24
 patch_len = 6
-num_encoder_layers = 2
-num_decoder_layers = 2
+num_encoder_layers = 6
+num_decoder_layers = 6
 d_ff = 4*d_model
-budget = 24
-top_k = 8
+budget = 12
+top_k = 4
 dropout = 0.1
 eps = torch.finfo(torch.float32).eps
 
-num_epochs = 3
+num_epochs = 400
 learning_rate = 1e-3
 
 model = TimeSeriesTransformer(
@@ -129,6 +132,7 @@ for epoch in range(num_epochs):
 
         optimizer.zero_grad()
         selector_output, output, indices, p = model(X.to(device), X_static.to(device), X_unsensed_static.to(device), beta)
+        # log(f"selector_output: {selector_output}, \n output: {output}, \n indices: {indices}, \n p: {p}")
 
         selected_set = set(indices.tolist())
         unselected_indices = torch.tensor([i for i in range(budget) if i not in selected_set], device=device)
@@ -198,6 +202,10 @@ for epoch in range(num_epochs):
             target = test_tensor[i, unsensed_indices, :, 0]
 
             loss = criterion(output, target)
+
+            if torch.isnan(loss):
+                log(f"target: {target}, \n output: {output}")
+                log(f"selected_indices: {selected_indices}, \n unsensed_indices: {unsensed_indices}, \n indices: {indices}")
             test_loss += loss.item()
 
             selected_indices_set = set()

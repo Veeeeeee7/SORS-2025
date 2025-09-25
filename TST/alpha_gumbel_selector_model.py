@@ -390,7 +390,7 @@ class TimeSeriesTransformer(nn.Module):
         """
         Selector
         """
-        selector_input = encoder_output_pooled + static_embedding.squeeze(1)
+        selector_input = encoder_output_pooled
         masked_encoder_embeddings, selected_sensors, p = self.selector(selector_input, beta)
         # print(f"selected_sensors.shape: {selected_sensors.shape}")
         # masked_encoder_embeddings: (num_sensed, d_model)
